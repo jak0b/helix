@@ -99,6 +99,8 @@ fn stage_blob_updates_only_the_index() {
     assert_eq!(git::get_index_base(&file, true).unwrap(), b"staged\ntwo\n");
     assert_eq!(std::fs::read(&file).unwrap(), b"worktree\ntwo\n");
     assert!(git::stage_blob(&file, true, &original, b"stale\ntwo\n").is_err());
+    create_commit(temp_git.path(), false);
+    assert_eq!(git::get_diff_base(&file, true).unwrap(), b"staged\ntwo\n");
 }
 
 #[test]
