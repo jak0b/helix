@@ -2737,7 +2737,7 @@ fn reset_diff_change(
     Ok(())
 }
 
-fn update_chunk_index(
+fn update_index(
     doc: &mut Document,
     providers: &helix_vcs::DiffProviderRegistry,
     path: &Path,
@@ -2831,7 +2831,7 @@ fn stage_chunk(
         "Git index changed; retry staging the chunk"
     );
     drop(diff);
-    update_chunk_index(doc, &providers, &path, trust_full, &expected, &staged)?;
+    update_index(doc, &providers, &path, trust_full, &expected, &staged)?;
     cx.editor.set_status(format!(
         "Staged {count} chunk{}",
         if count == 1 { "" } else { "s" }
@@ -2952,11 +2952,71 @@ fn unstage_chunk(
         })
         .collect();
     let (new_index, count) = unstage_selected_hunks(&head, &index, &selected)?;
-    update_chunk_index(doc, &providers, &path, trust_full, &expected, &new_index)?;
+    update_index(doc, &providers, &path, trust_full, &expected, &new_index)?;
     cx.editor.set_status(format!(
         "Unstaged {count} chunk{}",
         if count == 1 { "" } else { "s" }
     ));
+    Ok(())
+}
+
+fn stage_buffer(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (_, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (index, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    ensure!(
+        index != *doc.text(),
+        "There are no unstaged changes in the buffer"
+    );
+    let buffer = doc.text().clone();
+    update_index(doc, &providers, &path, trust_full, &expected, &buffer)?;
+    cx.editor.set_status("Staged buffer");
+    Ok(())
+}
+
+fn unstage_buffer(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (_, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (index, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    let head = providers
+        .get_diff_base(&path, trust_full)
+        .context("Could not read the Git HEAD version")?;
+    let (head, ..) = helix_view::document::from_reader(&mut head.as_slice(), Some(doc.encoding()))?;
+    ensure!(index != head, "There are no staged changes in the buffer");
+    update_index(doc, &providers, &path, trust_full, &expected, &head)?;
+    cx.editor.set_status("Unstaged buffer");
     Ok(())
 }
 
@@ -4224,6 +4284,28 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         aliases: &[],
         doc: "Remove the staged diff chunk at each selection from the Git index.",
         fun: unstage_chunk,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stage-buffer",
+        aliases: &[],
+        doc: "Stage the current buffer, including unsaved changes, in the Git index.",
+        fun: stage_buffer,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "unstage-buffer",
+        aliases: &[],
+        doc: "Remove all staged changes in the current buffer from the Git index.",
+        fun: unstage_buffer,
         completer: CommandCompleter::none(),
         signature: Signature {
             positionals: (0, Some(0)),

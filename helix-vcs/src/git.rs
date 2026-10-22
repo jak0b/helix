@@ -99,7 +99,7 @@ pub fn get_index_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
 pub fn stage_blob(file: &Path, trust_full: bool, expected: &[u8], contents: &[u8]) -> Result<()> {
     let (workdir, path) = git_file(file, trust_full)?;
     if get_index_base(file, trust_full)? != expected {
-        bail!("Git index changed; retry staging the chunk");
+        bail!("Git index changed; retry staging");
     }
     // Use gix's trust-aware filter pipeline. Git's `hash-object --path` would run
     // repository-configured clean filters even when the workspace is untrusted.
@@ -124,7 +124,7 @@ pub fn stage_blob(file: &Path, trust_full: bool, expected: &[u8], contents: &[u8
         .next()
         .context("file is not in the Git index")?;
     if !matches!(mode, b"100644" | b"100755") {
-        bail!("chunk staging requires a regular tracked file");
+        bail!("staging requires a regular tracked file");
     }
     let mut hash = Command::new("git")
         .current_dir(&workdir)
