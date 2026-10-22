@@ -90,6 +90,8 @@
 | `:reset-diff-change`, `:diffget`, `:diffg` | Reset the diff change at the cursor position. |
 | `:stage-chunk` | Stage the diff chunk at each selection in the Git index. |
 | `:unstage-chunk` | Remove the staged diff chunk at each selection from the Git index. |
+| `:stage-buffer` | Stage the current buffer, including unsaved changes, in the Git index. |
+| `:unstage-buffer` | Remove all staged changes in the current buffer from the Git index. |
 | `:clear-register` | Clear given register. If no argument is provided, clear all registers. |
 | `:set-register` | Set contents of the given register. |
 | `:redraw` | Clear and re-render the whole UI |
