@@ -4,7 +4,7 @@ use helix_core::syntax::config::LanguageServerFeature;
 
 use crate::{
     editor::GutterType,
-    graphics::{Style, UnderlineStyle},
+    graphics::{Modifier, Style, UnderlineStyle},
     Document, Editor, Theme, View,
 };
 
@@ -101,6 +101,27 @@ pub fn diff<'doc>(
     let modified = theme.get("diff.delta.gutter");
     if let Some(diff_handle) = doc.diff_handle() {
         let hunks = diff_handle.load();
+        let staged = doc.index_diff_handle().map(|index_handle| {
+            let index = index_handle.load();
+            (0..hunks.len())
+                .map(|n| {
+                    let head_hunk = hunks.nth_hunk(n);
+                    !(0..index.len()).any(|i| {
+                        let unstaged = index.nth_hunk(i);
+                        let head = &head_hunk.after;
+                        let worktree = &unstaged.after;
+                        if head.is_empty() {
+                            worktree.start <= head.start && head.start < worktree.end
+                                || worktree.is_empty() && head.start == worktree.start
+                        } else if worktree.is_empty() {
+                            head.start <= worktree.start && worktree.start < head.end
+                        } else {
+                            head.start < worktree.end && worktree.start < head.end
+                        }
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
         let mut hunk_i = 0;
         let mut hunk = hunks.nth_hunk(hunk_i);
         Box::new(
@@ -121,6 +142,11 @@ pub fn diff<'doc>(
                     return None;
                 }
 
+                let is_staged = staged
+                    .as_ref()
+                    .and_then(|s| s.get(hunk_i as usize))
+                    .copied()
+                    .unwrap_or(false);
                 let (icon, style) = if hunk.is_pure_insertion() {
                     ("▍", added)
                 } else if hunk.is_pure_removal() {
@@ -133,7 +159,11 @@ pub fn diff<'doc>(
                 };
 
                 write!(out, "{}", icon).unwrap();
-                Some(style)
+                Some(if is_staged {
+                    style.add_modifier(Modifier::DIM)
+                } else {
+                    style
+                })
             },
         )
     } else {

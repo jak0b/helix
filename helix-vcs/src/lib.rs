@@ -14,7 +14,7 @@ mod git;
 
 mod diff;
 
-pub use diff::{DiffHandle, Hunk};
+pub use diff::{diff_hunks, DiffHandle, Hunk};
 
 mod status;
 
@@ -28,6 +28,28 @@ pub struct DiffProviderRegistry {
 }
 
 impl DiffProviderRegistry {
+    pub fn get_index_base(&self, file: &Path, trust_full: bool) -> Option<Vec<u8>> {
+        self.providers.iter().find_map(|provider| match provider {
+            #[cfg(feature = "git")]
+            DiffProvider::Git => git::get_index_base(file, trust_full).ok(),
+            DiffProvider::None => None,
+        })
+    }
+
+    pub fn stage_blob(
+        &self,
+        file: &Path,
+        trust_full: bool,
+        expected: &[u8],
+        contents: &[u8],
+    ) -> Result<()> {
+        match self.providers.first() {
+            #[cfg(feature = "git")]
+            Some(DiffProvider::Git) => git::stage_blob(file, trust_full, expected, contents),
+            _ => bail!("Git support is not available"),
+        }
+    }
+
     /// Get the given file from the VCS. This provides the unedited document as a "base"
     /// for a diff to be created.
     pub fn get_diff_base(&self, file: &Path, trust_full: bool) -> Option<Vec<u8>> {

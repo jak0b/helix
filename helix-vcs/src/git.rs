@@ -1,8 +1,9 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -63,6 +64,106 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     } else {
         Ok(data)
     }
+}
+
+fn git_file(file: &Path, trust_full: bool) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let file = gix::path::realpath(file)?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let workdir = repo.workdir().context("repository has no working tree")?;
+    Ok((
+        workdir.to_path_buf(),
+        file.strip_prefix(workdir)?.to_path_buf(),
+    ))
+}
+
+/// Return the index version with Git's worktree filters applied.
+pub fn get_index_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
+    let file = gix::path::realpath(file)?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let workdir = repo.workdir().context("repository has no working tree")?;
+    let path = file.strip_prefix(workdir)?;
+    let path_bytes = gix::path::try_into_bstr(path)?;
+    let index = repo.index()?;
+    let entry = index
+        .entry_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?;
+    let data = repo.find_object(entry.id)?.detach().data;
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    let mut outcome = pipeline.convert_to_worktree(&data, path_bytes.as_ref(), Delay::Forbid)?;
+    let mut result = Vec::with_capacity(data.len());
+    outcome.read_to_end(&mut result)?;
+    Ok(result)
+}
+
+/// Replace one index blob, leaving the working tree untouched.
+pub fn stage_blob(file: &Path, trust_full: bool, expected: &[u8], contents: &[u8]) -> Result<()> {
+    let (workdir, path) = git_file(file, trust_full)?;
+    if get_index_base(file, trust_full)? != expected {
+        bail!("Git index changed; retry staging the chunk");
+    }
+    // Use gix's trust-aware filter pipeline. Git's `hash-object --path` would run
+    // repository-configured clean filters even when the workspace is untrusted.
+    let repo = open_repo(&workdir, trust_full)?.to_thread_local();
+    let index = repo.index()?;
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    let mut filtered = pipeline.convert_to_git(contents, &path, &index)?;
+    let mut blob = Vec::new();
+    filtered.read_to_end(&mut blob)?;
+    let entry = Command::new("git")
+        .current_dir(&workdir)
+        .args(["-c", "core.fsmonitor=false"])
+        .args(["ls-files", "--stage", "--"])
+        .arg(&path)
+        .output()?;
+    if !entry.status.success() {
+        bail!("failed to read Git index entry");
+    }
+    let mode = entry
+        .stdout
+        .split(|&b| b == b' ')
+        .next()
+        .context("file is not in the Git index")?;
+    if !matches!(mode, b"100644" | b"100755") {
+        bail!("chunk staging requires a regular tracked file");
+    }
+    let mut hash = Command::new("git")
+        .current_dir(&workdir)
+        .args(["-c", "core.fsmonitor=false", "hash-object", "-w", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    hash.stdin
+        .take()
+        .context("Git hash input unavailable")?
+        .write_all(&blob)?;
+    let hash = hash.wait_with_output()?;
+    if !hash.status.success() {
+        bail!("failed to write Git blob");
+    }
+    let oid = hash.stdout.strip_suffix(b"\n").unwrap_or(&hash.stdout);
+    let mut update = Command::new("git")
+        .current_dir(workdir)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "update-index",
+            "-z",
+            "--index-info",
+        ])
+        .stdin(Stdio::piped())
+        .spawn()?;
+    let mut input = update.stdin.take().context("Git index input unavailable")?;
+    input.write_all(mode)?;
+    input.write_all(b" ")?;
+    input.write_all(oid)?;
+    input.write_all(b"\t")?;
+    input.write_all(path.as_os_str().as_encoded_bytes())?;
+    input.write_all(b"\0")?;
+    drop(input);
+    if !update.wait()?.success() {
+        bail!("failed to update Git index");
+    }
+    Ok(())
 }
 
 pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwap<Box<str>>>> {

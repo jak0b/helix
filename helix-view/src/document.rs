@@ -207,6 +207,7 @@ pub struct Document {
     pub(crate) language_servers: HashMap<LanguageServerName, Arc<Client>>,
 
     diff_handle: Option<DiffHandle>,
+    index_diff_handle: Option<DiffHandle>,
     version_control_head: Option<Arc<ArcSwap<Box<str>>>>,
 
     // when document was used for most-recent-used buffer picker
@@ -760,6 +761,7 @@ impl Document {
             modified_since_accessed: false,
             language_servers: HashMap::new(),
             diff_handle: None,
+            index_diff_handle: None,
             config,
             version_control_head: None,
             focused_at: std::time::Instant::now(),
@@ -1314,6 +1316,10 @@ impl Document {
             Some(diff_base) => self.set_diff_base(diff_base),
             None => self.diff_handle = None,
         }
+        match provider_registry.get_index_base(&path, trust_full) {
+            Some(index_base) => self.set_index_diff_base(index_base),
+            None => self.index_diff_handle = None,
+        }
 
         self.version_control_head = provider_registry.get_current_head_name(&path, trust_full);
 
@@ -1527,6 +1533,9 @@ impl Document {
         // TODO: all of that should likely just be hooks
         // start computing the diff in parallel
         if let Some(diff_handle) = &self.diff_handle {
+            diff_handle.update_document(self.text.clone(), false);
+        }
+        if let Some(diff_handle) = &self.index_diff_handle {
             diff_handle.update_document(self.text.clone(), false);
         }
 
@@ -1987,6 +1996,22 @@ impl Document {
 
     pub fn diff_handle(&self) -> Option<&DiffHandle> {
         self.diff_handle.as_ref()
+    }
+
+    pub fn index_diff_handle(&self) -> Option<&DiffHandle> {
+        self.index_diff_handle.as_ref()
+    }
+
+    pub fn set_index_diff_base(&mut self, index_base: Vec<u8>) {
+        if let Ok((index_base, ..)) = from_reader(&mut index_base.as_slice(), Some(self.encoding)) {
+            if let Some(differ) = &self.index_diff_handle {
+                differ.update_diff_base(index_base);
+            } else {
+                self.index_diff_handle = Some(DiffHandle::new(index_base, self.text.clone()));
+            }
+        } else {
+            self.index_diff_handle = None;
+        }
     }
 
     /// Intialize/updates the differ for this document with a new base.

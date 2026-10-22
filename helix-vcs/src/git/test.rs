@@ -85,6 +85,46 @@ fn modified_file() {
     );
 }
 
+#[test]
+fn stage_blob_updates_only_the_index() {
+    let temp_git = empty_git_repo();
+    let file = temp_git.path().join("file.txt");
+    std::fs::write(&file, b"one\ntwo\n").unwrap();
+    create_commit(temp_git.path(), true);
+    std::fs::write(&file, b"worktree\ntwo\n").unwrap();
+
+    let original = git::get_index_base(&file, true).unwrap();
+    assert_eq!(original, b"one\ntwo\n");
+    git::stage_blob(&file, true, &original, b"staged\ntwo\n").unwrap();
+    assert_eq!(git::get_index_base(&file, true).unwrap(), b"staged\ntwo\n");
+    assert_eq!(std::fs::read(&file).unwrap(), b"worktree\ntwo\n");
+    assert!(git::stage_blob(&file, true, &original, b"stale\ntwo\n").is_err());
+}
+
+#[test]
+fn stage_blob_applies_line_ending_filters() {
+    let temp_git = empty_git_repo();
+    exec_git_cmd("config core.autocrlf true", temp_git.path());
+    let file = temp_git.path().join("file.txt");
+    std::fs::write(&file, b"one\r\ntwo\r\n").unwrap();
+    create_commit(temp_git.path(), true);
+
+    let original = git::get_index_base(&file, true).unwrap();
+    assert_eq!(original, b"one\r\ntwo\r\n");
+    git::stage_blob(&file, true, &original, b"staged\r\ntwo\r\n").unwrap();
+    assert_eq!(
+        git::get_index_base(&file, true).unwrap(),
+        b"staged\r\ntwo\r\n"
+    );
+    let raw = Command::new("git")
+        .current_dir(temp_git.path())
+        .args(["show", ":file.txt"])
+        .output()
+        .unwrap();
+    assert!(raw.status.success());
+    assert_eq!(raw.stdout, b"staged\ntwo\n");
+}
+
 /// Test that `get_file_head` does not return content for a directory.
 /// This is important to correctly cover cases where a directory is removed and replaced by a file.
 /// If the contents of the directory object were returned a diff between a path and the directory children would be produced.
