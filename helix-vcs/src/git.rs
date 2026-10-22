@@ -1,9 +1,8 @@
 use anyhow::{bail, Context, Result};
 use arc_swap::ArcSwap;
 use gix::filter::plumbing::driver::apply::Delay;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::Arc;
 
 use gix::bstr::ByteSlice;
@@ -98,71 +97,51 @@ pub fn get_index_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
 /// Replace one index blob, leaving the working tree untouched.
 pub fn stage_blob(file: &Path, trust_full: bool, expected: &[u8], contents: &[u8]) -> Result<()> {
     let (workdir, path) = git_file(file, trust_full)?;
-    if get_index_base(file, trust_full)? != expected {
+    let repo = open_repo(&workdir, trust_full)?.to_thread_local();
+    // Read the index after acquiring its lock, so another Git operation cannot
+    // update it between our read and write.
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )?;
+    let mut index = repo.open_index()?;
+    let path_bytes = gix::path::try_into_bstr(&path)?;
+    let entry = index
+        .entry_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?;
+    if !matches!(
+        entry.mode,
+        gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
+    ) {
+        bail!("chunk staging requires a regular tracked file");
+    }
+    let data = repo.find_object(entry.id)?.detach().data;
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    let mut worktree_outcome =
+        pipeline.convert_to_worktree(&data, path_bytes.as_ref(), Delay::Forbid)?;
+    let mut current = Vec::with_capacity(data.len());
+    worktree_outcome.read_to_end(&mut current)?;
+    drop(worktree_outcome);
+    if current != expected {
         bail!("Git index changed; retry staging the chunk");
     }
-    // Use gix's trust-aware filter pipeline. Git's `hash-object --path` would run
-    // repository-configured clean filters even when the workspace is untrusted.
-    let repo = open_repo(&workdir, trust_full)?.to_thread_local();
-    let index = repo.index()?;
-    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    // The trust-aware pipeline ignores untrusted repository-local clean filters.
     let mut filtered = pipeline.convert_to_git(contents, &path, &index)?;
     let mut blob = Vec::new();
     filtered.read_to_end(&mut blob)?;
-    let entry = Command::new("git")
-        .current_dir(&workdir)
-        .args(["-c", "core.fsmonitor=false"])
-        .args(["ls-files", "--stage", "--"])
-        .arg(&path)
-        .output()?;
-    if !entry.status.success() {
-        bail!("failed to read Git index entry");
-    }
-    let mode = entry
-        .stdout
-        .split(|&b| b == b' ')
-        .next()
-        .context("file is not in the Git index")?;
-    if !matches!(mode, b"100644" | b"100755") {
-        bail!("chunk staging requires a regular tracked file");
-    }
-    let mut hash = Command::new("git")
-        .current_dir(&workdir)
-        .args(["-c", "core.fsmonitor=false", "hash-object", "-w", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    hash.stdin
-        .take()
-        .context("Git hash input unavailable")?
-        .write_all(&blob)?;
-    let hash = hash.wait_with_output()?;
-    if !hash.status.success() {
-        bail!("failed to write Git blob");
-    }
-    let oid = hash.stdout.strip_suffix(b"\n").unwrap_or(&hash.stdout);
-    let mut update = Command::new("git")
-        .current_dir(workdir)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "update-index",
-            "-z",
-            "--index-info",
-        ])
-        .stdin(Stdio::piped())
-        .spawn()?;
-    let mut input = update.stdin.take().context("Git index input unavailable")?;
-    input.write_all(mode)?;
-    input.write_all(b" ")?;
-    input.write_all(oid)?;
-    input.write_all(b"\t")?;
-    input.write_all(path.as_os_str().as_encoded_bytes())?;
-    input.write_all(b"\0")?;
-    drop(input);
-    if !update.wait()?.success() {
-        bail!("failed to update Git index");
-    }
+    let oid = repo.write_blob(&blob)?.detach();
+    index
+        .entry_mut_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?
+        .id = oid;
+    // gix does not invalidate the tree cache automatically when an entry changes.
+    index.remove_tree();
+    let mut lock = std::io::BufWriter::new(lock);
+    index.write_to(&mut lock, Default::default())?;
+    lock.into_inner()
+        .map_err(|err| err.into_error())?
+        .commit()?;
     Ok(())
 }
 
