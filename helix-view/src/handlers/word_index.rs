@@ -3,7 +3,7 @@
 //! This provides an eventually consistent set of words used in any open buffers. This set is
 //! later used for lexical completion.
 
-use std::{borrow::Cow, iter, sync::Arc, time::Duration};
+use std::{borrow::Cow, collections::HashSet, iter, sync::Arc, time::Duration};
 
 use foldhash::HashMap;
 use helix_core::{
@@ -219,6 +219,15 @@ pub struct WordIndex {
 }
 
 impl WordIndex {
+    /// Match words in the current document snapshot, including edits that have not yet
+    /// reached the debounced index of open buffers.
+    pub fn matches_in_text(text: RopeSlice, pattern: &str) -> Vec<String> {
+        let candidates: HashSet<String> = words(text).map(|word| word.to_string()).collect();
+        let mut matches = fuzzy_match(pattern, candidates, false);
+        matches.sort_unstable_by_key(|(_, score)| *score);
+        matches.into_iter().map(|(word, _)| word).collect()
+    }
+
     pub fn matches(&self, pattern: &str) -> Vec<String> {
         let inner = self.inner.read();
         let mut matches = fuzzy_match(pattern, inner.words(), false);
@@ -565,6 +574,16 @@ mod tests {
     fn parse() {
         assert_words("one two three", ["one", "two", "three"]);
         assert_words("a foo c", ["foo"]);
+    }
+
+    #[test]
+    fn matches_current_text_without_indexing() {
+        let text = Rope::from_str("alphabet alpine alpha");
+        let matches = WordIndex::matches_in_text(text.slice(..), "alp");
+        assert_eq!(matches.len(), 3);
+        assert!(matches.contains(&"alphabet".to_string()));
+        assert!(matches.contains(&"alpine".to_string()));
+        assert!(matches.contains(&"alpha".to_string()));
     }
 
     #[track_caller]
