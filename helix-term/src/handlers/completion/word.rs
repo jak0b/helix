@@ -1,4 +1,4 @@
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use helix_core::{
     self as core, chars::char_is_word, completion::CompletionProvider, movement, Transaction,
@@ -6,7 +6,9 @@ use helix_core::{
 use helix_event::TaskHandle;
 use helix_stdx::rope::RopeSliceExt as _;
 use helix_view::{
-    document::SavePoint, handlers::completion::ResponseContext, Document, Editor, ViewId,
+    document::SavePoint,
+    handlers::{completion::ResponseContext, word_index::WordIndex},
+    Document, Editor, ViewId,
 };
 
 use super::{request::TriggerKind, CompletionItem, CompletionItems, CompletionResponse, Trigger};
@@ -72,9 +74,18 @@ pub(super) fn completion(
     let future = move || {
         let text = rope.slice(..);
         let typed_word: Cow<_> = text.slice(typed_word_range).into();
-        let items = word_index
-            .matches(&typed_word)
+        let mut seen = HashSet::new();
+        // A manual request should reflect the buffer immediately, even while its
+        // latest edits are waiting for the shared index's debounce interval.
+        let current_words = if trigger.kind == TriggerKind::Manual {
+            WordIndex::matches_in_text(text, &typed_word)
+        } else {
+            Vec::new()
+        };
+        let items = current_words
             .into_iter()
+            .chain(word_index.matches(&typed_word))
+            .filter(|word| seen.insert(word.clone()))
             .filter(|word| word.as_str() != typed_word.as_ref())
             .map(|word| {
                 let transaction = Transaction::change_by_selection(&rope, &selection, |range| {
