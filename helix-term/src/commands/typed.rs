@@ -2737,6 +2737,289 @@ fn reset_diff_change(
     Ok(())
 }
 
+fn update_index(
+    doc: &mut Document,
+    providers: &helix_vcs::DiffProviderRegistry,
+    path: &Path,
+    trust_full: bool,
+    expected: &[u8],
+    new_index: &Rope,
+) -> anyhow::Result<()> {
+    let mut contents = Vec::new();
+    let encoding = doc.encoding();
+    if expected.starts_with(&[0xef, 0xbb, 0xbf]) {
+        contents.extend_from_slice(&[0xef, 0xbb, 0xbf]);
+    } else if expected.starts_with(&[0xff, 0xfe]) && encoding == helix_core::encoding::UTF_16LE {
+        contents.extend_from_slice(&[0xff, 0xfe]);
+    } else if expected.starts_with(&[0xfe, 0xff]) && encoding == helix_core::encoding::UTF_16BE {
+        contents.extend_from_slice(&[0xfe, 0xff]);
+    }
+    let text = new_index.to_string();
+    if encoding == helix_core::encoding::UTF_16LE || encoding == helix_core::encoding::UTF_16BE {
+        for unit in text.encode_utf16() {
+            let bytes = if encoding == helix_core::encoding::UTF_16LE {
+                unit.to_le_bytes()
+            } else {
+                unit.to_be_bytes()
+            };
+            contents.extend_from_slice(&bytes);
+        }
+    } else {
+        contents.extend_from_slice(&encoding.encode(&text).0);
+    }
+    providers.stage_blob(path, trust_full, expected, &contents)?;
+    let index_base = providers
+        .get_index_base(path, trust_full)
+        .context("Could not refresh the Git index")?;
+    doc.set_index_diff_base(index_base);
+    Ok(())
+}
+
+fn stage_chunk(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (view, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let handle = doc
+        .index_diff_handle()
+        .context("Git index diff is not available in the current buffer")?;
+    let diff = handle.load();
+    let base = diff.diff_base();
+    let text = doc.text().slice(..);
+    let mut count = 0;
+    let transaction = Transaction::change(
+        base,
+        diff.hunks_intersecting_line_ranges(doc.selection(view.id).line_ranges(text))
+            .map(|hunk| {
+                count += 1;
+                let start = text.line_to_char(hunk.after.start as usize);
+                let end = text.line_to_char(hunk.after.end as usize);
+                let replacement: Tendril = text.slice(start..end).chunks().collect();
+                (
+                    base.line_to_char(hunk.before.start as usize),
+                    base.line_to_char(hunk.before.end as usize),
+                    (!replacement.is_empty()).then_some(replacement),
+                )
+            }),
+    );
+    ensure!(
+        count > 0,
+        "There are no unstaged changes under any selection"
+    );
+    let mut staged = base.clone();
+    ensure!(
+        transaction.apply(&mut staged),
+        "Could not apply selected chunks to the index text"
+    );
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (current_base, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    ensure!(
+        current_base == *base,
+        "Git index changed; retry staging the chunk"
+    );
+    drop(diff);
+    update_index(doc, &providers, &path, trust_full, &expected, &staged)?;
+    cx.editor.set_status(format!(
+        "Staged {count} chunk{}",
+        if count == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+/// Map a visible buffer line back to its position in the Git index.
+fn buffer_line_to_index(line: u32, unstaged: &[Hunk]) -> u32 {
+    let mut offset = 0i64;
+    for hunk in unstaged {
+        if line < hunk.after.start {
+            break;
+        }
+        if line < hunk.after.end || hunk.after.is_empty() && line == hunk.after.start {
+            return hunk.before.start
+                + (line - hunk.after.start).min(hunk.before.end - hunk.before.start);
+        }
+        offset = hunk.before.end as i64 - hunk.after.end as i64;
+    }
+    (line as i64 + offset).max(0) as u32
+}
+
+fn unstage_selected_hunks(
+    head: &Rope,
+    index: &Rope,
+    selected: &[(u32, u32)],
+) -> anyhow::Result<(Rope, usize)> {
+    let staged = helix_vcs::diff_hunks(head.clone(), index.clone());
+    let mut count = 0;
+    let transaction = Transaction::change(
+        index,
+        staged
+            .iter()
+            .filter(|hunk| {
+                selected
+                    .iter()
+                    .any(|&(start, end)| hunk.after.start <= end && start <= hunk.after.end)
+            })
+            .map(|hunk| {
+                count += 1;
+                let start = head.line_to_char(hunk.before.start as usize);
+                let end = head.line_to_char(hunk.before.end as usize);
+                let replacement: Tendril = head.slice(start..end).chunks().collect();
+                (
+                    index.line_to_char(hunk.after.start as usize),
+                    index.line_to_char(hunk.after.end as usize),
+                    (!replacement.is_empty()).then_some(replacement),
+                )
+            }),
+    );
+    ensure!(count > 0, "There are no staged changes under any selection");
+    let mut new_index = index.clone();
+    ensure!(
+        transaction.apply(&mut new_index),
+        "Could not remove selected chunks from the index text"
+    );
+    Ok((new_index, count))
+}
+
+fn unstage_chunk(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (view, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let head_handle = doc
+        .diff_handle()
+        .context("Git diff is not available in the current buffer")?;
+    let index_handle = doc
+        .index_diff_handle()
+        .context("Git index diff is not available in the current buffer")?;
+    let head = head_handle.load().diff_base().clone();
+    let index_diff = index_handle.load();
+    let index = index_diff.diff_base().clone();
+    let unstaged: Vec<Hunk> = (0..index_diff.len())
+        .map(|i| index_diff.nth_hunk(i))
+        .collect();
+    drop(index_diff);
+
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (current_index, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    ensure!(
+        current_index == index,
+        "Git index changed; retry unstaging the chunk"
+    );
+    let current_head = providers
+        .get_diff_base(&path, trust_full)
+        .context("Could not read the Git HEAD version")?;
+    let (current_head, ..) =
+        helix_view::document::from_reader(&mut current_head.as_slice(), Some(doc.encoding()))?;
+    ensure!(
+        current_head == head,
+        "Git HEAD changed; reload before unstaging"
+    );
+
+    let text = doc.text().slice(..);
+    let selected: Vec<_> = doc
+        .selection(view.id)
+        .line_ranges(text)
+        .map(|(start, end)| {
+            (
+                buffer_line_to_index(start as u32, &unstaged),
+                buffer_line_to_index(end as u32, &unstaged),
+            )
+        })
+        .collect();
+    let (new_index, count) = unstage_selected_hunks(&head, &index, &selected)?;
+    update_index(doc, &providers, &path, trust_full, &expected, &new_index)?;
+    cx.editor.set_status(format!(
+        "Unstaged {count} chunk{}",
+        if count == 1 { "" } else { "s" }
+    ));
+    Ok(())
+}
+
+fn stage_buffer(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (_, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (index, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    ensure!(
+        index != *doc.text(),
+        "There are no unstaged changes in the buffer"
+    );
+    let buffer = doc.text().clone();
+    update_index(doc, &providers, &path, trust_full, &expected, &buffer)?;
+    cx.editor.set_status("Staged buffer");
+    Ok(())
+}
+
+fn unstage_buffer(
+    cx: &mut compositor::Context,
+    _args: Args,
+    event: PromptEvent,
+) -> anyhow::Result<()> {
+    if event != PromptEvent::Validate {
+        return Ok(());
+    }
+    let trust_full = doc_trust_full(cx.editor);
+    let providers = cx.editor.diff_providers.clone();
+    let (_, doc) = current!(cx.editor);
+    let path = doc
+        .path()
+        .context("Current buffer has no file path")?
+        .to_path_buf();
+    let expected = providers
+        .get_index_base(&path, trust_full)
+        .context("Could not read the Git index")?;
+    let (index, ..) =
+        helix_view::document::from_reader(&mut expected.as_slice(), Some(doc.encoding()))?;
+    let head = providers
+        .get_diff_base(&path, trust_full)
+        .context("Could not read the Git HEAD version")?;
+    let (head, ..) = helix_view::document::from_reader(&mut head.as_slice(), Some(doc.encoding()))?;
+    ensure!(index != head, "There are no staged changes in the buffer");
+    update_index(doc, &providers, &path, trust_full, &expected, &head)?;
+    cx.editor.set_status("Unstaged buffer");
+    Ok(())
+}
+
 fn clear_register(
     cx: &mut compositor::Context,
     args: Args,
@@ -3986,6 +4269,50 @@ pub const TYPABLE_COMMAND_LIST: &[TypableCommand] = &[
         },
     },
     TypableCommand {
+        name: "stage-chunk",
+        aliases: &[],
+        doc: "Stage the diff chunk at each selection in the Git index.",
+        fun: stage_chunk,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "unstage-chunk",
+        aliases: &[],
+        doc: "Remove the staged diff chunk at each selection from the Git index.",
+        fun: unstage_chunk,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "stage-buffer",
+        aliases: &[],
+        doc: "Stage the current buffer, including unsaved changes, in the Git index.",
+        fun: stage_buffer,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
+        name: "unstage-buffer",
+        aliases: &[],
+        doc: "Remove all staged changes in the current buffer from the Git index.",
+        fun: unstage_buffer,
+        completer: CommandCompleter::none(),
+        signature: Signature {
+            positionals: (0, Some(0)),
+            ..Signature::DEFAULT
+        },
+    },
+    TypableCommand {
         name: "clear-register",
         aliases: &[],
         doc: "Clear given register. If no argument is provided, clear all registers.",
@@ -4605,4 +4932,33 @@ fn exclude_workspace(
     cx.editor.workspace_trust.exclude(&workspace);
     cx.editor.config_events.0.send(ConfigEvent::Refresh)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+
+    #[test]
+    fn unstage_preserves_other_staged_chunks_after_unstaged_insertions() {
+        let head = Rope::from_str("a\nb\nc\nd\ne\nf\ng\nh\n");
+        let index = Rope::from_str("a\nB\nc\nd\ne\nF\ng\nh\n");
+        let buffer = Rope::from_str("a\nnew\nB\nc\nd\ne\nF\ng\nh\n");
+        let unstaged = helix_vcs::diff_hunks(index.clone(), buffer);
+        let selected = [(
+            buffer_line_to_index(6, &unstaged),
+            buffer_line_to_index(6, &unstaged),
+        )];
+        let (new_index, count) = unstage_selected_hunks(&head, &index, &selected).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(new_index.to_string(), "a\nB\nc\nd\ne\nf\ng\nh\n");
+    }
+
+    #[test]
+    fn unstage_restores_a_staged_deletion() {
+        let head = Rope::from_str("a\nb\nc\nd\n");
+        let index = Rope::from_str("a\nc\nd\n");
+        let (new_index, count) = unstage_selected_hunks(&head, &index, &[(1, 1)]).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(new_index, head);
+    }
 }

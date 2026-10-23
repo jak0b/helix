@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use helix_core::Rope;
 use helix_event::RenderLockGuard;
-use imara_diff::Algorithm;
+use imara_diff::{Algorithm, IndentHeuristic, IndentLevel};
 use parking_lot::{RwLock, RwLockReadGuard};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -15,6 +15,27 @@ pub use imara_diff::Hunk;
 
 mod line_cache;
 mod worker;
+
+/// Compute a snapshot of the diff between two texts.
+pub fn diff_hunks(before: Rope, after: Rope) -> Vec<Hunk> {
+    let lines = line_cache::InternedRopeLines::new(before, after);
+    let Some(input) = lines.interned_lines() else {
+        return Vec::new();
+    };
+    let mut diff = imara_diff::Diff::default();
+    diff.compute_with(
+        ALGORITHM,
+        &input.before,
+        &input.after,
+        input.interner.num_tokens(),
+    );
+    diff.postprocess_with(
+        &input.before,
+        &input.after,
+        IndentHeuristic::new(|token| IndentLevel::for_ascii_line(input.interner[token].bytes(), 4)),
+    );
+    diff.hunks().collect()
+}
 
 /// A rendering lock passed to the differ the prevents redraws from occurring
 struct RenderLock {

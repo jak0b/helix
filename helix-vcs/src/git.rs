@@ -65,6 +65,86 @@ pub fn get_diff_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
     }
 }
 
+fn git_file(file: &Path, trust_full: bool) -> Result<(std::path::PathBuf, std::path::PathBuf)> {
+    let file = gix::path::realpath(file)?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let workdir = repo.workdir().context("repository has no working tree")?;
+    Ok((
+        workdir.to_path_buf(),
+        file.strip_prefix(workdir)?.to_path_buf(),
+    ))
+}
+
+/// Return the index version with Git's worktree filters applied.
+pub fn get_index_base(file: &Path, trust_full: bool) -> Result<Vec<u8>> {
+    let file = gix::path::realpath(file)?;
+    let repo = open_repo(get_repo_dir(&file)?, trust_full)?.to_thread_local();
+    let workdir = repo.workdir().context("repository has no working tree")?;
+    let path = file.strip_prefix(workdir)?;
+    let path_bytes = gix::path::try_into_bstr(path)?;
+    let index = repo.index()?;
+    let entry = index
+        .entry_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?;
+    let data = repo.find_object(entry.id)?.detach().data;
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    let mut outcome = pipeline.convert_to_worktree(&data, path_bytes.as_ref(), Delay::Forbid)?;
+    let mut result = Vec::with_capacity(data.len());
+    outcome.read_to_end(&mut result)?;
+    Ok(result)
+}
+
+/// Replace one index blob, leaving the working tree untouched.
+pub fn stage_blob(file: &Path, trust_full: bool, expected: &[u8], contents: &[u8]) -> Result<()> {
+    let (workdir, path) = git_file(file, trust_full)?;
+    let repo = open_repo(&workdir, trust_full)?.to_thread_local();
+    // Read the index after acquiring its lock, so another Git operation cannot
+    // update it between our read and write.
+    let lock = gix::lock::File::acquire_to_update_resource(
+        &repo.index_path(),
+        gix::lock::acquire::Fail::Immediately,
+        None,
+    )?;
+    let mut index = repo.open_index()?;
+    let path_bytes = gix::path::try_into_bstr(&path)?;
+    let entry = index
+        .entry_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?;
+    if !matches!(
+        entry.mode,
+        gix::index::entry::Mode::FILE | gix::index::entry::Mode::FILE_EXECUTABLE
+    ) {
+        bail!("chunk staging requires a regular tracked file");
+    }
+    let data = repo.find_object(entry.id)?.detach().data;
+    let (mut pipeline, _) = repo.filter_pipeline(None)?;
+    let mut worktree_outcome =
+        pipeline.convert_to_worktree(&data, path_bytes.as_ref(), Delay::Forbid)?;
+    let mut current = Vec::with_capacity(data.len());
+    worktree_outcome.read_to_end(&mut current)?;
+    drop(worktree_outcome);
+    if current != expected {
+        bail!("Git index changed; retry staging the chunk");
+    }
+    // The trust-aware pipeline ignores untrusted repository-local clean filters.
+    let mut filtered = pipeline.convert_to_git(contents, &path, &index)?;
+    let mut blob = Vec::new();
+    filtered.read_to_end(&mut blob)?;
+    let oid = repo.write_blob(&blob)?.detach();
+    index
+        .entry_mut_by_path_and_stage(path_bytes.as_ref(), gix::index::entry::Stage::Unconflicted)
+        .context("file is not in the Git index")?
+        .id = oid;
+    // gix does not invalidate the tree cache automatically when an entry changes.
+    index.remove_tree();
+    let mut lock = std::io::BufWriter::new(lock);
+    index.write_to(&mut lock, Default::default())?;
+    lock.into_inner()
+        .map_err(|err| err.into_error())?
+        .commit()?;
+    Ok(())
+}
+
 pub fn get_current_head_name(file: &Path, trust_full: bool) -> Result<Arc<ArcSwap<Box<str>>>> {
     debug_assert!(!file.exists() || file.is_file());
     debug_assert!(file.is_absolute());

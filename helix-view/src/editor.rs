@@ -2125,6 +2125,9 @@ impl Editor {
             if let Some(diff_base) = self.diff_providers.get_diff_base(&path, trust_full) {
                 doc.set_diff_base(diff_base);
             }
+            if let Some(index_base) = self.diff_providers.get_index_base(&path, trust_full) {
+                doc.set_index_diff_base(index_base);
+            }
             doc.set_version_control_head(
                 self.diff_providers.get_current_head_name(&path, trust_full),
             );
