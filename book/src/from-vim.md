@@ -86,7 +86,7 @@ Note: `x` selects the entire line under the cursor
 
 auto complete:
 * vim: `C-p`
-* helix: `C-x`
+* helix: `C-p` or `C-n` (also `C-x`)
 
 comment lines:
 * vim: `gc`

@@ -523,6 +523,8 @@ fn main() {
 ### `[editor.word-completion]` Section
 
 Options for controlling completion of words from open buffers.
+Manual completion (`Ctrl-n`, `Ctrl-p`, or `Ctrl-x` in insert mode) also checks
+the current buffer immediately, including edits not yet added to the word index.
 
 | Key                  | Description                                                    | Default  |
 | ---                  | ---                                                            | ---      |
